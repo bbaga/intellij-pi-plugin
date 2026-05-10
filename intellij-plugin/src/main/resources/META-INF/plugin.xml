@@ -1,0 +1,38 @@
+<idea-plugin>
+    <id>dev.pi.intellij-diff</id>
+    <name>Pi Coding Agent Diff Approval</name>
+    <vendor email="support@pi.dev" url="https://pi.dev">Pi</vendor>
+
+    <description><![CDATA[
+        Opens IntelliJ diff approval dialogs for Pi Coding Agent file edits and writes.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.plugins.terminal</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="dev.pi.intellijdiff.PiDiffApprovalService"/>
+        <projectService serviceImplementation="dev.pi.intellijdiff.PiContextFocusService"/>
+        <applicationConfigurable instance="dev.pi.intellijdiff.PiDiffSettingsConfigurable"
+                                 id="dev.pi.intellijDiffSettings"
+                                 displayName="Pi Diff Approval"/>
+        <notificationGroup id="Pi Diff Approval" displayType="BALLOON"/>
+        <toolWindow id="Pi" anchor="right" factoryClass="dev.pi.intellijdiff.PiToolWindowFactory"/>
+    </extensions>
+
+    <actions>
+        <action id="dev.pi.intellij-diff.StartPiAgent"
+                class="dev.pi.intellijdiff.StartPiAgentAction"
+                text="Start Pi Agent"
+                description="Start Pi Coding Agent in a terminal at the project root">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <add-to-group group-id="MainToolbarRight" anchor="last"/>
+        </action>
+        <action id="dev.pi.intellij-diff.AddToPiContext"
+                class="dev.pi.intellijdiff.AddToPiContextAction"
+                text="Add to Pi Context"
+                description="Use selected file(s) as focused context for the next Pi prompt">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

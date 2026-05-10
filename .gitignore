@@ -1,0 +1,41 @@
+# Gradle build output and caches
+.gradle/
+**/.gradle/
+build/
+**/build/
+
+# IntelliJ Platform Gradle Plugin generated files
+.intellijPlatform/
+**/.intellijPlatform/
+
+# Kotlin compiler/session caches
+.kotlin/
+**/.kotlin/
+
+# IntelliJ IDEA project/user files
+.idea/
+*.iml
+*.iws
+out/
+
+# Node/TypeScript local artifacts
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local env/secrets
+.env
+.env.*
+!.env.example
