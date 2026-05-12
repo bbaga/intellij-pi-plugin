@@ -1,6 +1,7 @@
 package dev.pi.intellijdiff
 
 import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.application.PathManager
 import com.intellij.openapi.components.PersistentStateComponent
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.State
@@ -19,6 +20,8 @@ class PiDiffSettings : PersistentStateComponent<PiDiffSettings.State> {
         var approveEdits: Boolean = true,
         var approveDeletes: Boolean = true,
         var reviewMode: String = "pre-apply",
+        var storeOriginalsOnDisk: Boolean = false,
+        var originalsCacheDir: String = defaultOriginalsCacheDir(),
     )
 
     private var state = State()
@@ -32,6 +35,8 @@ class PiDiffSettings : PersistentStateComponent<PiDiffSettings.State> {
 
     companion object {
         fun getInstance(): PiDiffSettings = ApplicationManager.getApplication().getService(PiDiffSettings::class.java)
+
+        fun defaultOriginalsCacheDir(): String = "${PathManager.getSystemPath()}/pi-diff-originals"
 
         fun generateToken(): String {
             val bytes = ByteArray(24)

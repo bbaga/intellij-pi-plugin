@@ -7,14 +7,14 @@ import {
   type ExtensionContext,
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 
 const DEFAULT_PORT = 63345;
 
-type Config = { port: number; token: string };
+type Config = { port: number; token: string; disabled: boolean };
 type MutationKind = "edit" | "write" | "delete";
 type ReviewMode = "pre-apply" | "post-prompt-review";
 type IdeSettings = {
@@ -22,10 +22,17 @@ type IdeSettings = {
   approveEdits: boolean;
   approveDeletes: boolean;
   reviewMode: ReviewMode;
+  storeOriginalsOnDisk: boolean;
+  originalsCacheDir: string;
 };
-type Baseline = { before: string; kind: MutationKind; existedBefore: boolean };
+type Baseline = { kind: MutationKind; existedBefore: boolean } & (
+  | { storage: "memory"; before: string }
+  | { storage: "disk"; beforePath: string }
+);
 type ReviewDecision = { path: string; action: "accept" | "reject" | "requestChanges"; reason?: string };
-type ReviewResult = { action: "accept" | "mixed" | "requestChanges"; request?: string; decisions?: ReviewDecision[] };
+type ReviewComment = { path: string; side: "before" | "after" | "unknown"; startLine: number; endLine: number; text: string; selectedText?: string };
+type ReviewResult = { action: "accept" | "mixed" | "requestChanges"; request?: string; decisions?: ReviewDecision[]; comments?: ReviewComment[] };
+type ReviewFilePayload = { path: string; displayPath: string; before: string; after: string; kind: MutationKind; existedBefore: boolean; summary: string };
 
 export default function (pi: ExtensionAPI) {
   const baselines = new Map<string, Baseline>();
@@ -33,12 +40,20 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerFlag("intellij-diff-port", { description: "Port for the Pi IntelliJ Diff plugin approval server", type: "string" });
   pi.registerFlag("intellij-diff-token", { description: "Bearer token for the Pi IntelliJ Diff plugin approval server", type: "string" });
+  pi.registerFlag("intellij-diff-disabled", { description: "Disable IntelliJ diff approval integration for this Pi session", type: "boolean" });
 
   function getConfig(): Config {
+    const disabledFlag = pi.getFlag("intellij-diff-disabled");
+    const disabledEnv = process.env.PI_INTELLIJ_DIFF_DISABLED;
     return {
       port: Number(pi.getFlag("intellij-diff-port") || process.env.PI_INTELLIJ_DIFF_PORT || DEFAULT_PORT),
       token: String(pi.getFlag("intellij-diff-token") || process.env.PI_INTELLIJ_DIFF_TOKEN || ""),
+      disabled: disabledFlag === true || disabledFlag === "true" || disabledEnv === "1" || disabledEnv === "true",
     };
+  }
+
+  function assertEnabled() {
+    if (getConfig().disabled) throw new Error("IntelliJ diff approval integration is disabled for this Pi session.");
   }
 
   function headers(config: Config): Record<string, string> {
@@ -46,6 +61,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function fetchSettings(signal?: AbortSignal): Promise<IdeSettings> {
+    assertEnabled();
     const config = getConfig();
     const response = await fetch(`http://127.0.0.1:${config.port}/api/pi/settings`, { method: "GET", headers: headers(config), signal });
     if (!response.ok) throw new Error(`HTTP ${response.status} ${await response.text()}`);
@@ -55,6 +71,8 @@ export default function (pi: ExtensionAPI) {
       approveEdits: settings.approveEdits ?? true,
       approveDeletes: settings.approveDeletes ?? true,
       reviewMode: settings.reviewMode ?? "pre-apply",
+      storeOriginalsOnDisk: settings.storeOriginalsOnDisk ?? false,
+      originalsCacheDir: settings.originalsCacheDir ?? "",
     };
   }
 
@@ -65,6 +83,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function checkHealth(config: Config, signal?: AbortSignal) {
+    if (config.disabled) throw new Error("IntelliJ diff approval integration is disabled for this Pi session.");
     const response = await fetch(`http://127.0.0.1:${config.port}/api/pi/health`, { method: "GET", headers: headers(config), signal });
     if (!response.ok) throw new Error(`HTTP ${response.status} ${await response.text()}`);
     return (await response.json()) as { ok?: boolean; port?: number; tokenRequired?: boolean };
@@ -72,6 +91,7 @@ export default function (pi: ExtensionAPI) {
 
   async function fetchIdeContext(ctx: ExtensionContext, consumeFocus = false) {
     const config = getConfig();
+    if (config.disabled) return undefined;
     const response = await fetch(`http://127.0.0.1:${config.port}/api/pi/context`, {
       method: "POST",
       headers: headers(config),
@@ -94,6 +114,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function approve(ctx: ExtensionContext, path: string, before: string, after: string, kind: MutationKind) {
+    assertEnabled();
     if (before === after) return;
     if (!ctx.hasUI && !process.env.PI_INTELLIJ_DIFF_ALLOW_HEADLESS) {
       throw new Error("IntelliJ diff approval requires interactive/RPC mode or PI_INTELLIJ_DIFF_ALLOW_HEADLESS=1.");
@@ -116,17 +137,42 @@ export default function (pi: ExtensionAPI) {
     if (!result.accepted) throw new Error(result.reason || "User rejected the change in IntelliJ.");
   }
 
-  async function recordBaseline(path: string, before: string, kind: MutationKind, existedBefore: boolean) {
-    if (!baselines.has(path)) baselines.set(path, { before, kind, existedBefore });
+  function cacheFilePath(cacheDir: string, path: string) {
+    const digest = createHash("sha256").update(path).digest("hex");
+    return resolve(cacheDir, `${Date.now()}-${digest}-${randomUUID()}.orig`);
+  }
+
+  async function readBaselineBefore(baseline: Baseline) {
+    return baseline.storage === "disk" ? readFile(baseline.beforePath, "utf8") : baseline.before;
+  }
+
+  async function removeBaselineCache(baseline: Baseline) {
+    if (baseline.storage === "disk") {
+      try { await unlink(baseline.beforePath); } catch {}
+    }
+  }
+
+  async function recordBaseline(path: string, before: string, kind: MutationKind, existedBefore: boolean, settings: IdeSettings) {
+    if (baselines.has(path)) return;
+    if (settings.storeOriginalsOnDisk && settings.originalsCacheDir) {
+      await mkdir(settings.originalsCacheDir, { recursive: true });
+      const beforePath = cacheFilePath(settings.originalsCacheDir, path);
+      await writeFile(beforePath, before, "utf8");
+      baselines.set(path, { storage: "disk", beforePath, kind, existedBefore });
+      return;
+    }
+    baselines.set(path, { storage: "memory", before, kind, existedBefore });
   }
 
   async function restoreBaseline(path: string, baseline: Baseline) {
     if (!baseline.existedBefore) {
       try { await unlink(path); } catch {}
+      await removeBaselineCache(baseline);
       return;
     }
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, baseline.before, "utf8");
+    await writeFile(path, await readBaselineBefore(baseline), "utf8");
+    await removeBaselineCache(baseline);
   }
 
   async function restoreBaselines() {
@@ -138,10 +184,45 @@ export default function (pi: ExtensionAPI) {
     const settings = await fetchSettings(ctx.signal);
     if (!enabled(settings, kind)) return;
     if (settings.reviewMode === "post-prompt-review") {
-      await recordBaseline(path, before, kind, existedBefore);
+      await recordBaseline(path, before, kind, existedBefore, settings);
     } else {
       await approve(ctx, path, before, after, kind);
     }
+  }
+
+  function semanticSummary(displayPath: string, before: string, after: string, kind: MutationKind, existedBefore: boolean): string {
+    if (kind === "delete") return "Remove this file";
+    if (kind === "write" && !existedBefore) return `Create ${displayPath}`;
+
+    const added = after.split("\n").filter((line) => !before.includes(line) && line.trim()).map((line) => line.trim());
+    const removed = before.split("\n").filter((line) => !after.includes(line) && line.trim()).map((line) => line.trim());
+    const lowerPath = displayPath.toLowerCase();
+    const changedText = added.join("\n").toLowerCase();
+
+    if (lowerPath.includes("github/workflows") || lowerPath.endsWith(".yml") || lowerPath.endsWith(".yaml")) {
+      if (/release|workflow_dispatch|gh release|tag/.test(changedText)) return "Add or update GitHub release automation";
+      if (/pull_request|verifyplugin|gradlew build|setup-java|setup-gradle/.test(changedText)) return "Add or update GitHub CI checks";
+      return "Update YAML workflow/configuration";
+    }
+    if (lowerPath.endsWith("readme.md") || lowerPath.includes("docs/")) return "Update project documentation";
+    if (lowerPath.endsWith(".kt")) {
+      if (/dialog|feedback|comment|review/.test(changedText)) return "Update IntelliJ review/feedback UI behavior";
+      if (/settings|configurable/.test(lowerPath + changedText)) return "Update IntelliJ plugin settings UI";
+      if (/terminal|toolwindow|toolbar/.test(lowerPath + changedText)) return "Update IntelliJ tool window/launcher behavior";
+      return "Update IntelliJ plugin Kotlin implementation";
+    }
+    if (lowerPath.endsWith(".ts")) {
+      if (/intellij.*diff|approval|token|disabled|tool_call/.test(changedText)) return "Update Pi IntelliJ diff extension behavior";
+      return "Update TypeScript extension code";
+    }
+    if (lowerPath.includes("gradle") || lowerPath.endsWith(".kts")) return "Update Gradle/plugin build configuration";
+
+    const addedCount = added.length;
+    const removedCount = removed.length;
+    if (addedCount && removedCount) return `Edit ${displayPath} (${addedCount} added, ${removedCount} removed lines)`;
+    if (addedCount) return `Add content to ${displayPath}`;
+    if (removedCount) return `Remove content from ${displayPath}`;
+    return `Update ${displayPath}`;
   }
 
   async function postPromptReview(ctx: ExtensionContext) {
@@ -149,16 +230,19 @@ export default function (pi: ExtensionAPI) {
     const settings = await fetchSettings(ctx.signal).catch(() => undefined);
     if (!settings || settings.reviewMode !== "post-prompt-review") return;
 
-    const files = [] as Array<{ path: string; displayPath: string; before: string; after: string; kind: MutationKind; existedBefore: boolean }>;
+    const files = [] as ReviewFilePayload[];
     for (const [path, baseline] of baselines) {
       let after = "";
       let existsAfter = true;
       try { after = await readFile(path, "utf8"); } catch { after = ""; existsAfter = false; }
-      if (baseline.before !== after || baseline.existedBefore !== existsAfter) {
-        files.push({ path, displayPath: relative(ctx.cwd, path) || path, before: baseline.before, after, kind: baseline.kind, existedBefore: baseline.existedBefore });
+      const before = await readBaselineBefore(baseline);
+      if (before !== after || baseline.existedBefore !== existsAfter) {
+        const displayPath = relative(ctx.cwd, path) || path;
+        files.push({ path, displayPath, before, after, kind: baseline.kind, existedBefore: baseline.existedBefore, summary: semanticSummary(displayPath, before, after, baseline.kind, baseline.existedBefore) });
       }
     }
     if (files.length === 0) {
+      for (const baseline of baselines.values()) await removeBaselineCache(baseline);
       baselines.clear();
       return;
     }
@@ -194,12 +278,25 @@ export default function (pi: ExtensionAPI) {
           baselines.delete(decision.path);
         }
       }
-      for (const decision of accepted) baselines.delete(decision.path);
+      for (const decision of accepted) {
+        const baseline = baselines.get(decision.path);
+        if (baseline) await removeBaselineCache(baseline);
+        baselines.delete(decision.path);
+      }
 
       if (needsChanges.length === 0) return;
 
+      const comments = result.comments?.length
+        ? `Line comments:\n${result.comments.map((c) => {
+            const path = relative(ctx.cwd, c.path) || c.path;
+            const range = c.startLine === c.endLine ? `${c.startLine}` : `${c.startLine}-${c.endLine}`;
+            return `- ${path}:${range} (${c.side})\n  ${c.text}${c.selectedText ? `\n  Selected:\n${c.selectedText.split("\n").map((line) => `    ${line}`).join("\n")}` : ""}`;
+          }).join("\n")}`
+        : "";
+
       const request = [
         result.request?.trim(),
+        comments,
         rejected.length
           ? `Rejected and restored:\n${rejected.map((d) => `- ${relative(ctx.cwd, d.path) || d.path}${d.reason ? `\n  Reason: ${d.reason}` : ""}`).join("\n")}`
           : "",
@@ -267,6 +364,12 @@ export default function (pi: ExtensionAPI) {
     return files;
   }
 
+  function looksLikeShellFileMutation(command: string): boolean {
+    return /(^|[^<])>{1,2}\s*[^&|]/.test(command) ||
+      /\b(tee|cp|mv|touch|truncate|install)\b/.test(command) ||
+      /\b(node|python3?|ruby|perl|php|sh|bash|zsh)\b.*\b(writeFile|writeFileSync|open\(|os\.remove|unlink|rename|copyfile|File\.write|IO\.write)\b/s.test(command);
+  }
+
   async function handleDeletionsFromBash(ctx: ExtensionContext, command: string) {
     const settings = await fetchSettings(ctx.signal);
     if (!enabled(settings, "delete")) return;
@@ -277,7 +380,7 @@ export default function (pi: ExtensionAPI) {
       if (files.length > 50) throw new Error(`Refusing to approve deletion of ${files.length} files from ${target}. Delete fewer files at once.`);
       for (const file of files) {
         const before = await readFile(file, "utf8");
-        if (settings.reviewMode === "post-prompt-review") await recordBaseline(file, before, "delete", true);
+        if (settings.reviewMode === "post-prompt-review") await recordBaseline(file, before, "delete", true, settings);
         else await approve(ctx, file, before, "", "delete");
       }
     }
@@ -329,9 +432,13 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const config = getConfig();
       try {
+        if (config.disabled) {
+          ctx.ui.notify("IntelliJ diff approval integration is disabled for this Pi session. File mutations will not be routed through IntelliJ.", "warning");
+          return;
+        }
         const health = await checkHealth(config, ctx.signal);
         const settings = await fetchSettings(ctx.signal);
-        ctx.ui.notify(`IntelliJ diff approval server is reachable on port ${health.port ?? config.port}. Mode: ${settings.reviewMode}. Creates=${settings.approveCreates}, edits=${settings.approveEdits}, deletes=${settings.approveDeletes}.`, "info");
+        ctx.ui.notify(`IntelliJ diff approval server is reachable on port ${health.port ?? config.port}. Mode: ${settings.reviewMode}. Creates=${settings.approveCreates}, edits=${settings.approveEdits}, deletes=${settings.approveDeletes}. Originals=${settings.storeOriginalsOnDisk ? `disk:${settings.originalsCacheDir}` : "memory"}.`, "info");
       } catch (error) {
         ctx.ui.notify(`IntelliJ diff approval server is not reachable: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
@@ -340,15 +447,29 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event, ctx) => {
     if (!isToolCallEventType("bash", event)) return;
-    if (deletionTargets(event.input.command).length === 0) return;
-    try { await handleDeletionsFromBash(ctx, event.input.command); }
-    catch (error) { return { block: true, reason: error instanceof Error ? error.message : String(error) }; }
+    const config = getConfig();
+    if (config.disabled) return;
+    if (deletionTargets(event.input.command).length > 0) {
+      try { await handleDeletionsFromBash(ctx, event.input.command); }
+      catch (error) { return { block: true, reason: error instanceof Error ? error.message : String(error) }; }
+      return;
+    }
+    if (config.token && looksLikeShellFileMutation(event.input.command)) {
+      return {
+        block: true,
+        reason: "IntelliJ diff approval is enabled. Refusing shell-based file mutation because it bypasses the edit/write approval tools. Use edit/write, or explicitly disable the integration with --intellij-diff-disabled / PI_INTELLIJ_DIFF_DISABLED=1.",
+      };
+    }
   });
 
   pi.on("agent_end", async (_event, ctx) => { await postPromptReview(ctx); });
 
   pi.on("session_start", (_event, ctx) => {
     const config = getConfig();
+    if (config.disabled) {
+      ctx.ui.setStatus("intellij-diff", "IntelliJ diff approvals: disabled");
+      return;
+    }
     const editOps: EditOperations = {
       readFile: (path) => readFile(path),
       access: (path) => access(path, constants.R_OK | constants.W_OK),

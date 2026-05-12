@@ -1,11 +1,15 @@
 package dev.pi.intellijdiff
 
 import com.intellij.diff.DiffContentFactory
-import com.intellij.diff.DiffManager
+import com.intellij.diff.editor.DiffEditorTabFilesManager
+import com.intellij.diff.editor.SimpleDiffVirtualFile
 import com.intellij.diff.requests.SimpleDiffRequest
+import com.intellij.notification.Notification
+import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
@@ -14,23 +18,17 @@ import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.project.ProjectManager
-import com.intellij.openapi.ui.DialogWrapper
-import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
-import java.awt.BorderLayout
 import java.net.BindException
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
-import javax.swing.Action
-import javax.swing.JComponent
-import javax.swing.JPanel
 
 @Service(Service.Level.APP)
 class PiDiffApprovalService : Disposable {
@@ -96,11 +94,15 @@ class PiDiffApprovalService : Disposable {
             if (exchange.requestMethod != "GET") return exchange.respond(405, "Only GET is supported")
             if (!isAuthorized(exchange)) return exchange.respond(401, "Invalid token")
             val s = PiDiffSettings.getInstance().state
-            exchange.respond(
-                200,
-                "{\"approveCreates\":${s.approveCreates},\"approveEdits\":${s.approveEdits},\"approveDeletes\":${s.approveDeletes},\"reviewMode\":\"${s.reviewMode}\"}",
-                "application/json",
-            )
+            val json = JsonObject().apply {
+                addProperty("approveCreates", s.approveCreates)
+                addProperty("approveEdits", s.approveEdits)
+                addProperty("approveDeletes", s.approveDeletes)
+                addProperty("reviewMode", s.reviewMode)
+                addProperty("storeOriginalsOnDisk", s.storeOriginalsOnDisk)
+                addProperty("originalsCacheDir", s.originalsCacheDir.ifBlank { PiDiffSettings.defaultOriginalsCacheDir() })
+            }
+            exchange.respond(200, json.toString(), "application/json")
         } catch (t: Throwable) {
             log.warn(t)
             exchange.respond(500, t.message ?: t.javaClass.name)
@@ -124,6 +126,7 @@ class PiDiffApprovalService : Disposable {
                     after = f.get("after").asString,
                     kind = f.get("kind").asString,
                     existedBefore = !f.has("existedBefore") || f.get("existedBefore").asBoolean,
+                    summary = if (f.has("summary")) f.get("summary").asString else "",
                 )
             }
             val result = showReviewAndWait(files)
@@ -188,13 +191,43 @@ class PiDiffApprovalService : Disposable {
         ApplicationManager.getApplication().invokeLater {
             try {
                 val project = chooseProject(request) ?: throw IllegalStateException("No open IntelliJ project for ${request.path}")
-                val dialog = PiDiffDialog(project, request)
-                future.complete(dialog.showAndGet())
+                val diffRequest = createDiffRequest(project, request)
+                val diffFile = SimpleDiffVirtualFile(diffRequest)
+                DiffEditorTabFilesManager.getInstance(project).showDiffFile(diffFile, true, true)
+
+                val notification = NotificationGroupManager.getInstance()
+                    .getNotificationGroup("Pi Diff Approval")
+                    .createNotification(
+                        "Pi wants to ${request.kind} ${request.displayPath.ifBlank { request.path }}",
+                        "Review the opened diff tab, then accept or reject the change.",
+                        NotificationType.INFORMATION,
+                    )
+                notification.addAction(object : NotificationAction("Accept") {
+                    override fun actionPerformed(e: AnActionEvent, notification: Notification) {
+                        if (future.complete(true)) FileEditorManager.getInstance(project).closeFile(diffFile)
+                        notification.expire()
+                    }
+                })
+                notification.addAction(object : NotificationAction("Reject") {
+                    override fun actionPerformed(e: AnActionEvent, notification: Notification) {
+                        if (future.complete(false)) FileEditorManager.getInstance(project).closeFile(diffFile)
+                        notification.expire()
+                    }
+                })
+                notification.notify(project)
             } catch (t: Throwable) {
                 future.completeExceptionally(t)
             }
         }
         return future.get()
+    }
+
+    private fun createDiffRequest(project: Project, request: DiffApprovalRequest): SimpleDiffRequest {
+        val file = LocalFileSystem.getInstance().findFileByPath(request.path)
+        val factory = DiffContentFactory.getInstance()
+        val before = if (file != null) factory.create(project, request.before, file.fileType) else factory.create(request.before)
+        val after = if (file != null) factory.create(project, request.after, file.fileType) else factory.create(request.after)
+        return SimpleDiffRequest(request.displayPath, before, after, "Before", "After")
     }
 
     private fun showReviewAndWait(files: List<ReviewFile>): ReviewResult {
@@ -277,37 +310,6 @@ class PiDiffApprovalService : Disposable {
 
     companion object {
         fun getInstance(): PiDiffApprovalService = service()
-    }
-}
-
-class PiDiffDialog(private val project: Project, private val request: DiffApprovalRequest) : DialogWrapper(project, true) {
-    private val disposable = Disposer.newDisposable("PiDiffDialog")
-    private val panel = JPanel(BorderLayout())
-
-    init {
-        title = "Pi wants to ${request.kind} ${request.displayPath.ifBlank { request.path }}"
-        setOKButtonText("Accept")
-        setCancelButtonText("Reject")
-        init()
-    }
-
-    override fun createCenterPanel(): JComponent {
-        val diffPanel = DiffManager.getInstance().createRequestPanel(project, disposable, null)
-        val file = LocalFileSystem.getInstance().findFileByPath(request.path)
-        val factory = DiffContentFactory.getInstance()
-        val before = if (file != null) factory.create(project, request.before, file.fileType) else factory.create(request.before)
-        val after = if (file != null) factory.create(project, request.after, file.fileType) else factory.create(request.after)
-        diffPanel.setRequest(SimpleDiffRequest(request.displayPath, before, after, "Before", "After"))
-        panel.add(diffPanel.component, BorderLayout.CENTER)
-        panel.preferredSize = java.awt.Dimension(1100, 750)
-        return panel
-    }
-
-    override fun createActions(): Array<Action> = arrayOf(okAction, cancelAction)
-
-    override fun dispose() {
-        Disposer.dispose(disposable)
-        super.dispose()
     }
 }
 

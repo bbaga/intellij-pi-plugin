@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Optional version to release. Must match intellij-plugin/build.gradle.kts when provided.
+        required: false
+        type: string
+      tag_name:
+        description: Optional tag name. Defaults to v<version>.
+        required: false
+        type: string
+      prerelease:
+        description: Mark the GitHub release as a prerelease.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build plugin and create GitHub release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Resolve release metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" != "branch" ]]; then
+            echo "Release workflow must be run from a branch, not ${GITHUB_REF_TYPE}." >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF_NAME}" != "master" && "${GITHUB_REF_NAME}" != "main" ]]; then
+            echo "Release workflow must be run from master or main. Current ref: ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+          version="$(sed -nE 's/^version = "([^"]+)"/\1/p' intellij-plugin/build.gradle.kts | head -n1)"
+          if [[ -z "${version}" ]]; then
+            echo "Could not read plugin version from intellij-plugin/build.gradle.kts" >&2
+            exit 1
+          fi
+
+          requested_version="${{ inputs.version }}"
+          if [[ -n "${requested_version}" && "${requested_version}" != "${version}" ]]; then
+            echo "Requested version ${requested_version} does not match Gradle version ${version}." >&2
+            exit 1
+          fi
+
+          tag_name="${{ inputs.tag_name }}"
+          if [[ -z "${tag_name}" ]]; then
+            tag_name="v${version}"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${tag_name}" >/dev/null; then
+            echo "Tag ${tag_name} already exists." >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag_name=${tag_name}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build plugin distribution
+        working-directory: intellij-plugin
+        run: |
+          chmod +x ./gradlew
+          ./gradlew clean build verifyPlugin buildPlugin
+
+      - name: Create and push tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.metadata.outputs.tag_name }}" -m "Release ${{ steps.metadata.outputs.tag_name }}"
+          git push origin "${{ steps.metadata.outputs.tag_name }}"
+
+      - name: Create GitHub release and upload plugin zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            "${{ steps.metadata.outputs.tag_name }}"
+            intellij-plugin/build/distributions/*.zip
+            --title "${{ steps.metadata.outputs.tag_name }}"
+            --notes "Pi IntelliJ Diff Approval ${{ steps.metadata.outputs.version }}"
+          )
+          if [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            args+=(--prerelease)
+          else
+            args+=(--latest)
+          fi
+          gh release create "${args[@]}"

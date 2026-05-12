@@ -2,7 +2,9 @@ package dev.pi.intellijdiff
 
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
+import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.options.Configurable
+import com.intellij.openapi.ui.TextFieldWithBrowseButton
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBTextField
@@ -21,6 +23,10 @@ class PiDiffSettingsConfigurable : Configurable {
     private val approveEdits = JBCheckBox("Show diff for edits")
     private val approveDeletes = JBCheckBox("Show diff for deletes")
     private val reviewMode = JComboBox(arrayOf("pre-apply", "post-prompt-review"))
+    private val storeOriginalsOnDisk = JBCheckBox("Store original file contents on disk during post-prompt review")
+    private val originalsCacheDir = TextFieldWithBrowseButton().apply {
+        addBrowseFolderListener(null, FileChooserDescriptorFactory.createSingleFolderDescriptor().withTitle("Select Originals Cache Directory"))
+    }
 
     override fun getDisplayName(): String = "Pi Diff Approval"
 
@@ -31,6 +37,8 @@ class PiDiffSettingsConfigurable : Configurable {
             .addLabeledComponent("Bearer token", tokenField)
             .addLabeledComponent("Pi command", piCommandField)
             .addLabeledComponent("Review mode", reviewMode)
+            .addComponent(storeOriginalsOnDisk)
+            .addLabeledComponent("Originals cache directory", originalsCacheDir)
             .addComponent(approveCreates)
             .addComponent(approveEdits)
             .addComponent(approveDeletes)
@@ -47,7 +55,9 @@ class PiDiffSettingsConfigurable : Configurable {
             approveCreates.isSelected != settings.state.approveCreates ||
             approveEdits.isSelected != settings.state.approveEdits ||
             approveDeletes.isSelected != settings.state.approveDeletes ||
-            reviewMode.selectedItem as String != settings.state.reviewMode
+            reviewMode.selectedItem as String != settings.state.reviewMode ||
+            storeOriginalsOnDisk.isSelected != settings.state.storeOriginalsOnDisk ||
+            originalsCacheDir.text != settings.state.originalsCacheDir
 
     override fun apply() {
         val oldPort = settings.state.port
@@ -58,6 +68,8 @@ class PiDiffSettingsConfigurable : Configurable {
         settings.state.approveEdits = approveEdits.isSelected
         settings.state.approveDeletes = approveDeletes.isSelected
         settings.state.reviewMode = reviewMode.selectedItem as String
+        settings.state.storeOriginalsOnDisk = storeOriginalsOnDisk.isSelected
+        settings.state.originalsCacheDir = originalsCacheDir.text.trim().ifBlank { PiDiffSettings.defaultOriginalsCacheDir() }
 
         if (settings.state.port != oldPort) {
             try {
@@ -79,6 +91,8 @@ class PiDiffSettingsConfigurable : Configurable {
         approveEdits.isSelected = settings.state.approveEdits
         approveDeletes.isSelected = settings.state.approveDeletes
         reviewMode.selectedItem = settings.state.reviewMode
+        storeOriginalsOnDisk.isSelected = settings.state.storeOriginalsOnDisk
+        originalsCacheDir.text = settings.state.originalsCacheDir.ifBlank { PiDiffSettings.defaultOriginalsCacheDir() }
     }
 
     override fun disposeUIResources() {

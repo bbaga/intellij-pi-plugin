@@ -5,8 +5,9 @@ import com.intellij.notification.NotificationType
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager
 import com.intellij.ui.content.ContentManager
-import org.jetbrains.plugins.terminal.TerminalView
+import org.jetbrains.plugins.terminal.startup.TerminalProcessType
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.file.Files
@@ -39,8 +40,17 @@ object PiAgentLauncher {
 
                 ApplicationManager.getApplication().invokeLater {
                     try {
-                        val terminal = TerminalView.getInstance(project).createLocalShellWidget(projectRoot, "Pi Agent", true)
-                        terminal.executeCommand(buildLaunchCommand(settings))
+                        TerminalToolWindowTabsManager.getInstance(project)
+                            .createTabBuilder()
+                            .workingDirectory(projectRoot)
+                            .tabName("Pi Agent")
+                            .processType(TerminalProcessType.SHELL)
+                            .requestFocus(true)
+                            .createTab()
+                            .view
+                            .createSendTextBuilder()
+                            .shouldExecute()
+                            .send(buildLaunchCommand(settings))
                     } catch (t: Throwable) {
                         notify(project, "Failed to open Pi terminal: ${t.message}", NotificationType.ERROR)
                     }
@@ -70,22 +80,29 @@ object PiAgentLauncher {
         throw IllegalStateException("Diff approval server did not become ready on port ${settings.port}: ${lastError?.message}")
     }
 
-    fun externalLaunchCommand(project: Project): String {
+    fun externalLaunchCommand(project: Project, tokenOverride: String? = null): String {
         val settings = PiDiffSettings.getInstance().state
         val projectRoot = project.basePath
         val cd = if (projectRoot.isNullOrBlank()) "" else "cd ${shellQuote(projectRoot)} && "
-        return cd + buildLaunchCommand(settings)
+        return cd + buildLaunchCommand(settings, tokenOverride?.trim()?.ifBlank { null } ?: settings.token)
     }
 
-    fun ensureExtensionAndServer(project: Project) {
+    fun ensureExtensionAndServer(project: Project, tokenOverride: String? = null) {
+        val customToken = tokenOverride?.trim()?.ifBlank { null }
+        val settings = PiDiffSettings.getInstance().state
+        if (customToken != null && settings.token != customToken) {
+            settings.token = customToken
+        }
         installPiExtension(project)
         PiDiffApprovalService.getInstance().start()
-        waitForServer(PiDiffSettings.getInstance().state)
+        waitForServer(settings)
     }
 
-    private fun buildLaunchCommand(settings: PiDiffSettings.State): String {
+    private fun buildLaunchCommand(settings: PiDiffSettings.State): String = buildLaunchCommand(settings, settings.token)
+
+    private fun buildLaunchCommand(settings: PiDiffSettings.State, token: String): String {
         return "PI_INTELLIJ_DIFF_PORT=${settings.port} " +
-            "PI_INTELLIJ_DIFF_TOKEN=${shellQuote(settings.token)} " +
+            "PI_INTELLIJ_DIFF_TOKEN=${shellQuote(token)} " +
             settings.piCommand
     }
 
